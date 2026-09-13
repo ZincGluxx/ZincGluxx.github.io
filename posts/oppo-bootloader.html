@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#faf9f6">
-  <meta name="description" content="从 OPPO Find X8s 与 Pad 5 的研究记录出发，理解 root、Fastboot、Bootloader 解锁和 Android 验证启动之间的关系。">
-  <title>拿到 root，为什么仍解不开锁？· ZincGluxx</title>
+  <meta name="description" content="解析 OPPO Find X8s 与 Pad 5 解锁记录中的内核提权、A/B 槽位、LK、Fastboot 和 Bootloader 锁状态。">
+  <title>OPPO Find X8s 与 Pad 5 解锁原理 · ZincGluxx</title>
   <link rel="canonical" href="https://zincgluxx.github.io/posts/oppo-bootloader.html">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/style.css">
@@ -21,50 +21,52 @@
       <a class="back-link" href="/">← 返回文章列表</a>
       <article>
         <header class="article-header">
-          <div class="post-meta"><time datetime="2026-09-13">2026 年 9 月 13 日</time><span class="meta-divider"></span><span>技术观察</span><span class="meta-divider"></span><span>约 12 分钟</span></div>
-          <h1>拿到 root，<br><em>为什么仍解不开锁？</em></h1>
-          <p class="article-lead">从 OPPO Find X8s 与 Pad 5 的两份研究记录出发，重新看 Android 启动链里的三道门。</p>
+          <div class="post-meta"><time datetime="2026-09-13">2026 年 9 月 13 日</time><span class="meta-divider"></span><span>原理解析</span><span class="meta-divider"></span><span>约 10 分钟</span></div>
+          <h1>OPPO Find X8s<br><em>与 Pad 5 解锁原理</em></h1>
+          <p class="article-lead">内核提权、A/B 槽位、LK、Fastboot 和 Bootloader 锁状态如何串成一条链。</p>
         </header>
 
         <div class="article-content">
-          <p>我在 GitHub 上整理过两份设备解锁记录：一份针对 <a href="https://github.com/ZincGluxx/OPPO-find-X8s-Unlock">OPPO Find X8s</a>，另一份针对 <a href="https://github.com/ZincGluxx/OPPO-Pad-5-Unlock">OPPO Pad 5</a>。如果只看操作表面，它们像是两套相似的刷机流程；往下一层看，真正有意思的是一个问题：<strong>为什么已经拿到系统里的最高权限，设备仍然不能直接解锁 Bootloader？</strong></p>
-          <p>这篇文章不复述命令清单。仓库 README 已经记录了特定版本下的尝试路径；这里更想把它们放回 Android 的安全模型里，解释每一步究竟跨过了哪一道边界，又有哪些结论不能轻易外推到别的设备。</p>
+          <p><a href="https://github.com/ZincGluxx/OPPO-find-X8s-Unlock">Find X8s</a> 和 <a href="https://github.com/ZincGluxx/OPPO-Pad-5-Unlock">Pad 5</a> 两份仓库记录的手段有所不同，但目标路径相同：在正在运行的 Android 中取得足够的写入权限，改变下一次启动使用的引导器镜像，让设备进入 Bootloader Fastboot，最后由引导器处理解锁请求。<strong>这里有三个独立问题：能否改写镜像、能否进入 Fastboot、引导器是否允许把锁状态改为 unlocked。</strong>解决前一个问题不自动解决后一个问题。</p>
 
-          <nav class="article-toc" aria-label="文章目录"><span>本文目录</span><ol><li><a href="#three-doors">系统里有三道不同的门</a></li><li><a href="#slots">A/B 槽位为什么关键</a></li><li><a href="#two-devices">同一思路，两种设备条件</a></li><li><a href="#ghostlock">漏洞编号能说明什么</a></li><li><a href="#after-unlock">解锁之后，控制权意味着什么</a></li><li><a href="#boundaries">比成功截图更重要的边界</a></li></ol></nav>
+          <figure class="mechanism-figure"><figcaption>两份仓库记录对应的机制链</figcaption><ol><li><span>01</span><div><strong>运行中的 Android</strong><small>内核提权，获得对目标分区的写入能力</small></div></li><li><span>02</span><div><strong>非活动槽位的 LK</strong><small>将特定固件对应的修改版引导器镜像写入另一槽位</small></div></li><li><span>03</span><div><strong>切槽并重新启动</strong><small>下一次启动读取目标槽位的引导组件</small></div></li><li><span>04</span><div><strong>Bootloader Fastboot</strong><small>引导器提供命令接口；此时仍不等于已解锁</small></div></li><li><span>05</span><div><strong>解锁状态转换</strong><small>引导器决定是否接受请求、要求确认并清除数据</small></div></li></ol></figure>
 
-          <h2 id="three-doors">01 · 系统里有三道不同的门</h2>
-          <p>日常说的“解锁”很容易把三个状态混在一起。第一道门是<strong>运行中的 Android 系统权限</strong>：root 让进程以更高权限访问当前系统。第二道门是<strong>引导器提供的 Fastboot 接口</strong>：电脑要与引导器对话，设备得先进入相应模式。第三道门才是<strong>Bootloader 的锁状态</strong>：它决定设备是否允许刷入非官方镜像，以及验证启动如何对待这些镜像。</p>
-          <p>这三个状态相关，却不能互相替代。AOSP 的<a href="https://source.android.com/docs/core/architecture/bootloader/locking_unlocking">引导器解锁文档</a>明确区分了进入 bootloader 模式与执行解锁；设备还应检查是否允许解锁，并在用户物理确认后清除数据。因此，root shell 不等于 Bootloader 已解锁；看到“fastboot mode”也不等于解锁命令一定会被接受。</p>
-          <blockquote>从系统权限走到可刷写状态，并非一次“提权”，而是连续跨越系统、引导器与设备信任状态的边界。</blockquote>
-          <p>这正是两份仓库记录的共同主线：先在特定旧版本中取得系统内的高权限，再处理引导器入口，最后才尝试改变锁状态。它也解释了为什么单独下载一个 root 工具，通常并不能回答“这台 OPPO 设备能否解锁”的问题。</p>
+          <nav class="article-toc" aria-label="文章目录"><span>阅读顺序</span><ol><li><a href="#boundaries">先分清三种权限与状态</a></li><li><a href="#privilege">内核提权解决了什么</a></li><li><a href="#ab-lk">为什么是另一槽位的 LK</a></li><li><a href="#fastboot">Fastboot 入口与最终解锁</a></li><li><a href="#comparison">两份仓库的差异</a></li><li><a href="#limits">哪些细节尚不能确认</a></li></ol></nav>
 
-          <h2 id="slots">02 · A/B 槽位为什么关键</h2>
-          <p>Android 的 A/B 更新把一部分可启动分区分成当前槽位与备用槽位。系统运行时，更新通常为下一次启动准备另一组镜像；新槽位启动失败，设备有机会回到旧槽位。这个设计首先服务于更新的可靠性，而不是为改机预留后门。AOSP 对<a href="https://source.android.com/docs/core/ota/ab">无缝更新</a>和<a href="https://source.android.com/docs/core/ota/ab/ab_implement">槽位实现</a>都有详细说明。</p>
-          <p>在我的两份记录中，关键动作都落在“另一槽位的 <code>lk</code> 镜像”上：不是在当前系统里直接宣布解锁，而是让下一次启动走到一个能提供 Fastboot 入口的引导阶段。<a href="https://github.com/ZincGluxx/OPPO-find-X8s-Unlock">Find X8s 记录</a>和<a href="https://github.com/ZincGluxx/OPPO-Pad-5-Unlock">Pad 5 记录</a>都特别强调槽位与固件版本的对应关系。</p>
-          <p>但“有 A/B 槽位”绝不意味着“任意设备都能这样做”。Android 的<a href="https://source.android.com/docs/security/features/verifiedboot">验证启动</a>把信任链从硬件根延伸到引导器和系统分区，还存在防回滚机制。能否写入、写入后能否被引导器接受、能否进入可用的 Fastboot，以及最终是否允许解锁，分别取决于设备实现和固件状态。把某个版本上的现象直接推广到同芯片的另一款机器，是最容易出错的一步。</p>
+          <h2 id="boundaries">一、先分清三种权限与状态</h2>
+          <p>把启动顺序压缩成一行，大致是<strong>早期引导组件 → LK 等引导阶段 → Android 内核 → 用户空间进程</strong>。实际设备还有厂商实现的验证阶段，但先后关系足以说明关键点：root 出现在 Android 已运行之后；Bootloader 的模式和锁状态却在更早的启动阶段被处理。AOSP 的<a href="https://source.android.com/docs/core/architecture/bootloader">引导器概览</a>也把引导器描述为装载内核并传递启动参数的组件。</p>
+          <p><strong>root 是运行时的 Linux 权限</strong>。一个进程在 Android 系统启动后获得 UID 0，可以执行比普通应用更多的系统操作；它并不会自动修改设备重启前由引导器读取的锁状态。系统还有 SELinux、只读分区与硬件信任链等约束，因此“拿到 root”也不应被简化成“任何分区都能无条件刷写”。</p>
+          <p><strong>Fastboot 是引导阶段的通信接口</strong>。AOSP 区分在 Bootloader 中运行的 Fastboot 和在用户空间运行的 <a href="https://source.android.com/docs/core/architecture/bootloader/fastbootd">fastbootd</a>；两份仓库要得到的是前者：设备重启后停在能够与电脑 Fastboot 客户端通信的引导器模式。能看到该模式，只说明入口可达。</p>
+          <p><strong>locked / unlocked 是持久的设备状态</strong>。按 <a href="https://source.android.com/docs/security/features/verifiedboot/device-state">Android Verified Boot 的设备状态说明</a>，锁定设备应验证所启动软件的来源；解锁状态允许不同的刷写和启动行为。<a href="https://source.android.com/docs/core/architecture/bootloader/locking_unlocking">AOSP 的解锁规范</a>还要求设备在接受解锁命令前检查解锁许可，并由用户在设备上确认，状态转换时清除用户数据。所以“root 成功”“显示 fastboot mode”“最终显示 unlocked”必须分别验证。</p>
 
-          <h2 id="two-devices">03 · 同一思路，两种设备条件</h2>
-          <p>两份 README 的目标版本并不相同。Find X8s 记录针对 <strong>ColorOS 15.0.1.610</strong>，描述了借助 <code>preload.so</code> 获取临时高权限、随后尽快完成引导阶段操作的路径；Pad 5 记录针对 <strong>ColorOS 16.0.9.400</strong>，描述了 GhostLock 与 KernelSU 参与的另一条路径。它们共有的是“先解决系统权限，再处理备用槽位的引导器入口”，不同的是取得权限的条件、时间窗口与固件依赖。</p>
-          <div class="table-scroll"><table><thead><tr><th>记录</th><th>明确写出的目标环境</th><th>最需要避免的误读</th></tr></thead><tbody><tr><td><a href="https://github.com/ZincGluxx/OPPO-find-X8s-Unlock">Find X8s</a></td><td>ColorOS 15.0.1.610；临时权限窗口</td><td>一次成功路径不代表新系统版本也适用</td></tr><tr><td><a href="https://github.com/ZincGluxx/OPPO-Pad-5-Unlock">Pad 5</a></td><td>OPD2506；ColorOS 16.0.9.400</td><td>同名平板的不同型号、地区固件不能直接等同</td></tr></tbody></table></div>
-          <p>两份 README 把处理器简称为“天玑 9400”，而 OPPO 官方的<a href="https://www.oppo.com/cn/smartphones/series-find-x/find-x8s/specs/">Find X8s 参数页</a>与<a href="https://www.oppo.com/cn/tablets/">平板产品页</a>标注的是<strong>天玑 9400+</strong>。写技术记录时，这类“差一个加号”的细节值得纠正：芯片家族相近，不等于引导器镜像、分区布局或安全补丁状态相同。</p>
+          <h2 id="privilege">二、内核提权解决了什么</h2>
+          <p>正常情况下，锁定设备不应允许普通应用改写关键引导组件。两份仓库首先争取的不是解锁标志，而是<strong>在当前系统内写入指定块设备的能力</strong>。这一步为后续替换另一槽位的 <code>lk.img</code> 创造条件。它发生在 Android 已经启动之后；只要引导器状态还没改变，下一次启动仍要面对引导阶段的检查。</p>
+          <p><a href="https://github.com/ZincGluxx/OPPO-find-X8s-Unlock">Find X8s 记录</a>针对 ColorOS 15.0.1.610，使用 <code>preload.so</code> 路径取得临时高权限，并描述了 SELinux 状态变化及很短的操作窗口。<code>LD_PRELOAD</code> 在这里是把共享库加载进目标进程的方式；具体如何从该进程触发内核漏洞，仓库没有提供可读的利用源码或逐步分析，不能仅凭文件名推断完整实现。</p>
+          <p><a href="https://github.com/ZincGluxx/OPPO-Pad-5-Unlock">Pad 5 记录</a>针对 OPD2506、ColorOS 16.0.9.400，使用 GhostLock 应用并配合 KernelSU 维持 root。两条路径的共同点是获得足够权限去处理引导分区；“临时权限”与“持久化 root”则是不同的运行时条件，不能相互替换。</p>
+          <p>仓库都提到 <code>CVE-2026-43499</code>。<a href="https://kernel.googlesource.com/pub/scm/linux/kernel/git/lee/vulns/+/0851e95b94de61015f1dd814be2b5aba84d9d06a/cve/published/2026/CVE-2026-43499.mbox">Linux 内核 CVE 公告</a>描述的是 <code>rtmutex</code> 的 <code>remove_waiter()</code>：代理锁回滚时，代码误用当前任务而非真正的等待任务，使后者的 <code>pi_blocked_on</code> 可能留下悬空引用。它解释了漏洞类别与潜在提权入口，却<strong>不能单独证明</strong>某个 OPPO 固件一定可利用，也不能证明仓库中的二进制具体怎样使用了它。</p>
 
-          <h2 id="ghostlock">04 · 漏洞编号能说明什么</h2>
-          <p>两个仓库都提到了 <code>CVE-2026-43499</code>。Linux 内核 CVE 记录将它描述为 <code>rtmutex</code> 的 <code>remove_waiter()</code> 在代理锁回滚路径上错误地使用当前任务，可能留下悬空的等待者状态；这属于内核层面的漏洞，而不是“天玑 9400+ 专属开关”。可核对的原始描述见<a href="https://kernel.googlesource.com/pub/scm/linux/kernel/git/lee/vulns/+/0851e95b94de61015f1dd814be2b5aba84d9d06a/cve/published/2026/CVE-2026-43499.json">Linux 内核 CVE 记录</a>。</p>
-          <p>这里必须把“漏洞存在”与“某台设备可用某个工具稳定提权”分开。CVE 页面证明的是上游问题及其修复背景，<em>不能单独证明</em>某个 OPPO 固件包含可利用的实现，也不能替代具体构建号、内核补丁和设备日志。我的仓库提供的是面向指定版本的实践记录；它们不是所有 Find X8s、Pad 5 或所有 ColorOS 版本的兼容性认证。</p>
+          <h2 id="ab-lk">三、为什么是另一槽位的 LK</h2>
+          <p>A/B 更新会为部分启动分区维护 <code>_a</code>、<code>_b</code> 两个槽位。设备从当前槽位运行时，更新系统通常把下一版写入非活动槽，准备好后再切换启动目标。<a href="https://source.android.com/docs/core/ota/ab">AOSP 的 A/B 更新说明</a>明确描述了 <code>update_engine</code> 写入备用槽，以及引导器根据槽位状态选择下一次启动目标的过程。这个机制解释了仓库为什么反复强调“当前槽位”和“相反槽位”：写错位置，改动就不会按预期在下一次启动生效，甚至可能损坏当前可启动路径。</p>
+          <p>两份仓库都附带或指向一个修改版 <code>lk.img</code>，并记录了把它放进非活动槽位、随后通过本地更新流程切槽的路径。LK 是引导阶段的组件，位于 Android 内核启动之前；在这条路径中，它承担的是<strong>让目标版本的设备出现 Bootloader Fastboot 入口</strong>这一环。上游 <a href="https://github.com/littlekernel/lk">Little Kernel 项目</a>能帮助理解 LK 所处的层级，但不能当作 OPPO 实际二进制的源码。它更不是“刷入后锁标志自动变成 unlocked”的同义词。</p>
+          <p>这里要区分<strong>仓库观察到的行为</strong>和<strong>尚未公开的补丁细节</strong>：两个仓库提供的是二进制镜像与操作记录，没有发布原厂 LK、修改后 LK 的逐字节差异或对应源代码。因此可以根据记录说“换用该镜像后出现了 Fastboot 入口”，却不能严谨地断言具体改了哪一个条件分支、验证检查或 USB 命令表。</p>
+          <p>另外，A/B 不是绕过 Android Verified Boot 的通用办法。<a href="https://source.android.com/docs/security/features/verifiedboot">验证启动</a>要求从硬件信任根逐级验证后续组件；防回滚也可能拒绝较旧镜像。设备是否允许当前系统写入 <code>lk</code>、写入后是否接受该镜像、切槽是否成功，都是固件和设备实现相关的前提。</p>
 
-          <h2 id="after-unlock">05 · 解锁之后，控制权意味着什么</h2>
-          <p>研究启动链并不只是为了得到一个“已解锁”的状态字。设备所有权还体现在使用者能否研究系统行为、验证自己的假设、修改功能边界。我另一个项目<a href="https://github.com/ZincGluxx/oplus-enduring-unlocker">长续航解锁</a>就是具体例子：它研究 ColorOS 的 MediaTurbo 如何维护“视频长续航模式”的应用支持列表，并用 LSPosed 模块让用户自己选择应用。项目 README 只声称在 Find X8s 的特定 ColorOS 16 环境中实测；其他版本仍需重新核验类名和策略实现。</p>
-          <p>这与 Bootloader 解锁不是同一个技术问题，却回答了“为什么有人在意控制权”。另一方面，<a href="https://source.android.com/docs/security/features/verifiedboot/device-state">锁定状态与验证启动</a>也确实保护数据与系统完整性。让用户拥有更多修改能力，通常也意味着用户要亲自承担来源验证、备份与恢复的责任。这两点都是真实的，不必把安全与自由写成简单的二选一。</p>
+          <h2 id="fastboot">四、Fastboot 入口与最终解锁</h2>
+          <p>切槽后若设备显示仓库所述的 <code>fastboot mode</code>，机制链只走到了第四步。此时电脑可以向引导器发起解锁请求，但是否接受请求由引导器决定。AOSP 把 <code>get_unlock_ability</code> 作为解锁许可条件，并要求在设备上进行物理确认；解锁操作会清除用户数据。这也是为什么不能把“Fastboot 可用”当成“Bootloader 已解锁”。</p>
+          <p>两份 README 的最后一步都记录了通过 Fastboot 发起解锁，并在设备上用按键确认。要验证结果，应该读取设备实际报告的锁状态，而不是只看命令发出或界面曾出现。若许可条件、设备实现或验证链不满足要求，进入 Fastboot 后仍可能被拒绝。</p>
 
-          <h2 id="boundaries">06 · 比成功截图更重要的边界</h2>
-          <p>如果未来继续整理这类记录，我更希望每篇都能回答四个问题：<strong>具体是哪台设备、哪一版固件、哪一个补丁状态、有哪些可核查的结果？</strong>二进制镜像最好保留来源与校验值；临时权限和最终锁状态应分别记录；失败、重启、数据清除和回退条件也应如实写出。这样，读者看到的是可审视的实验条件，而不是一串看似通用的命令。</p>
-          <p>尤其要记住，AOSP 指出 Bootloader 状态变化会触发用户确认与数据清除；防回滚也可能让“刷回旧版本”并不像字面上那么简单。备份不是文章末尾的例行提醒，而是这类实验能否负责任地开始的前提。本文也不应被当作跨版本刷机指南：一旦设备、固件或镜像来源与记录不一致，就应重新验证，而不是凭经验猜测。</p>
-          <p>回过头看，两份 OPPO 仓库真正值得留下的，不只是一条可操作的路径。它们把 Android 设备上的控制权拆成了几个可以讨论的层次：<strong>运行时权限、引导入口、持久锁状态，以及验证启动的信任链。</strong>理解这些层次之后，“拿到 root，为什么仍解不开锁”就不再是反常现象，而是整个系统设计的自然结果。</p>
+          <h2 id="comparison">五、两份仓库的差异</h2>
+          <div class="table-scroll"><table><thead><tr><th>环节</th><th>Find X8s</th><th>Pad 5</th></tr></thead><tbody><tr><td>记录限定的版本</td><td>ColorOS 15.0.1.610</td><td>OPD2506 / ColorOS 16.0.9.400</td></tr><tr><td>系统内权限来源</td><td><code>preload.so</code>，记录为临时权限窗口</td><td>GhostLock 应用，配合 KernelSU</td></tr><tr><td>引导阶段的共同目标</td><td>非活动槽位的修改版 LK</td><td>非活动槽位的修改版 LK</td></tr><tr><td>最终状态转换</td><td>Bootloader Fastboot 中请求解锁</td><td>Bootloader Fastboot 中请求解锁</td></tr></tbody></table></div>
+          <p>处理器型号不应被用来代替固件匹配条件。OPPO 官方的 <a href="https://www.oppo.com/cn/smartphones/series-find-x/find-x8s/specs/">Find X8s 参数页</a>和<a href="https://www.oppo.com/cn/tablets/">平板产品页</a>都标为天玑 9400+；仓库 README 中的“天玑 9400”是简写。即使 SoC 同属一个系列，两机的 LK 镜像也不能因此视为可互换，目标版本号更不能省略。</p>
 
-          <section class="article-sources" aria-labelledby="sources-title"><h2 id="sources-title">资料与说明</h2><p>本文以我公开的 <a href="https://github.com/ZincGluxx/OPPO-find-X8s-Unlock">Find X8s</a>、<a href="https://github.com/ZincGluxx/OPPO-Pad-5-Unlock">Pad 5</a> 和 <a href="https://github.com/ZincGluxx/oplus-enduring-unlocker">长续航解锁</a>仓库为原始材料；技术背景对照了 <a href="https://source.android.com/docs/core/architecture/bootloader/locking_unlocking">AOSP 引导器文档</a>、<a href="https://source.android.com/docs/core/ota/ab">A/B 更新说明</a>、<a href="https://source.android.com/docs/security/features/verifiedboot">验证启动文档</a>、<a href="https://kernel.googlesource.com/pub/scm/linux/kernel/git/lee/vulns/+/0851e95b94de61015f1dd814be2b5aba84d9d06a/cve/published/2026/CVE-2026-43499.json">Linux 内核 CVE 记录</a>与 OPPO 官方产品参数。仓库中的具体操作记录与公开标准文档属于不同层级的证据，文中已分别标明。</p></section>
+          <h2 id="limits">六、哪些细节尚不能确认</h2>
+          <p>从现有公开材料可以重建<strong>权限获取 → 写入非活动槽位 LK → 切槽 → Bootloader Fastboot → 解锁请求</strong>这条流程，但不能进一步声称：某个 LK 镜像具体修改了哪些指令；所有同型号设备都允许写入关键分区；某个安全补丁版本仍受该 CVE 影响；或任何拿到 root 的设备都能复用这套方法。要回答这些问题，需要原始镜像与补丁差异、内核构建信息、设备日志，以及解锁前后的状态输出。</p>
+          <p>这篇文章解释的是两份仓库记录的原理，不是跨版本刷机步骤。实际风险集中在错误的槽位、错误的镜像、失败的启动验证和解锁时的数据清除。尤其是<a href="https://source.android.com/docs/security/features/verifiedboot/boot-flow">防回滚与 A/B 回退</a>并不等价：备用槽位还在，也不保证旧版本始终能启动。</p>
+
+          <section class="article-sources" aria-labelledby="sources-title"><h2 id="sources-title">参考资料</h2><ol><li><a href="https://github.com/ZincGluxx/OPPO-find-X8s-Unlock">OPPO Find X8s 解锁仓库</a>与<a href="https://github.com/ZincGluxx/OPPO-Pad-5-Unlock">OPPO Pad 5 解锁仓库</a>：设备版本、文件及记录流程。</li><li><a href="https://source.android.com/docs/core/architecture/bootloader/locking_unlocking">AOSP：Bootloader 锁定与解锁</a>、<a href="https://source.android.com/docs/core/architecture/bootloader/fastbootd">Fastboot / fastbootd</a>：引导器接口和状态转换。</li><li><a href="https://source.android.com/docs/core/ota/ab">AOSP：A/B 更新</a>、<a href="https://source.android.com/docs/security/features/verifiedboot">验证启动</a>：槽位和信任链。</li><li><a href="https://kernel.googlesource.com/pub/scm/linux/kernel/git/lee/vulns/+/0851e95b94de61015f1dd814be2b5aba84d9d06a/cve/published/2026/CVE-2026-43499.mbox">Linux 内核 CVE-2026-43499 公告</a>：上游漏洞机制。</li></ol></section>
         </div>
       </article>
-      <div class="article-end"><span>写于此刻，留给以后。</span><a href="/">更多文章 →</a></div>
+      <div class="article-end"><span>原理解析 · 2026</span><a href="/">更多文章 →</a></div>
     </main>
 
     <footer class="site-footer"><span>© 2026 ZincGluxx</span><span>写作，积累，继续向前。</span></footer>

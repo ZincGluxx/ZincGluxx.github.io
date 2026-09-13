@@ -75,9 +75,20 @@ h1 em { color: var(--accent); font-style: normal; }
 .article-content th { color: var(--ink); font-weight: 700; border-top: 1px solid var(--ink); }
 .article-content td { color: var(--soft-ink); }
 .article-content table a { text-decoration: none; }
+.mechanism-figure { margin: 46px 0 52px; padding: 26px 31px 28px; background: #f2f0ea; border: 1px solid var(--line); }
+.mechanism-figure figcaption { color: var(--ink); font: 700 13px/1.6 'DM Sans', sans-serif; margin-bottom: 18px; }
+.mechanism-figure ol { list-style: none; margin: 0; padding: 0; }
+.mechanism-figure li { display: flex; gap: 19px; position: relative; padding: 0 0 18px; }
+.mechanism-figure li:last-child { padding-bottom: 0; }
+.mechanism-figure li:not(:last-child)::before { content: ''; position: absolute; top: 26px; left: 12px; bottom: 0; width: 1px; background: #d9d1c6; }
+.mechanism-figure li > span { flex: 0 0 25px; height: 25px; display: grid; place-items: center; border-radius: 50%; background: var(--accent); color: #fff; font: 700 10px/1 'DM Sans', sans-serif; z-index: 1; }
+.mechanism-figure strong { display: block; font: 700 14px/1.6 'DM Sans', sans-serif; margin-bottom: 2px; }
+.mechanism-figure small { display: block; color: var(--soft-ink); font: 12px/1.8 'DM Sans', sans-serif; }
 .article-sources { margin-top: 78px; padding-top: 4px; border-top: 1px solid var(--line); }
 .article-sources h2 { font-size: 20px; margin: 30px 0 18px; }
 .article-sources p { color: var(--soft-ink); font-size: 14px; line-height: 2; }
+.article-sources ol { margin: 0; padding-left: 22px; color: var(--soft-ink); font-size: 14px; line-height: 2; }
+.article-sources li { padding-left: 5px; margin-bottom: 12px; }
 .article-end { border-top: 1px solid var(--line); margin-top: 70px; padding-top: 22px; display: flex; justify-content: space-between; gap: 20px; color: #92968e; font-size: 12px; }
 .article-end a { color: var(--accent); font-weight: 700; }
 .error-shell .site-header { border-bottom: 0; }
@@ -110,6 +121,7 @@ h1 em { color: var(--accent); font-style: normal; }
   .article-content blockquote { font-size: 17px; padding-left: 18px; }
   .article-toc { padding: 23px; }
   .article-toc ol { grid-template-columns: 1fr; }
+  .mechanism-figure { padding: 23px; }
 }
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
