@@ -127,3 +127,15 @@ h1 em { color: var(--accent); font-style: normal; }
   html { scroll-behavior: auto; }
   *, *::before, *::after { transition-duration: .01ms !important; animation-duration: .01ms !important; }
 }
+
+/* --- longform additions: h3 / lists / code blocks --- */
+.article-content h3 { color: var(--ink); font: 600 19px/1.6 'Noto Serif SC', serif; letter-spacing: -.02em; margin: 52px 0 18px; scroll-margin-top: 28px; }
+.article-content ul, .article-content ol { margin: 0 0 28px; padding-left: 26px; }
+.article-content li { margin-bottom: 10px; }
+.article-content li::marker { color: #b9a899; }
+.article-content pre { margin: 30px 0 32px; padding: 20px 24px; background: #f2f0ea; border: 1px solid var(--line); overflow-x: auto; }
+.article-content pre code { display: block; background: none; padding: 0; color: var(--ink); font: 12.5px/1.8 'DM Sans', Consolas, monospace; letter-spacing: .02em; white-space: pre; }
+@media (max-width: 640px) {
+  .article-content h3 { margin-top: 42px; }
+  .article-content pre { padding: 16px 18px; }
+}

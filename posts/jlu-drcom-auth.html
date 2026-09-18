@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#faf9f6">
+  <meta name="description" content="基于 Rust 重写吉林大学 Dr.COM 校园网客户端的实战记录：协议逆向路径、挑战/登录/保活帧的逐字段拆解，以及把私有协议做成软件的工程思路。">
+  <title>吉林大学校园网认证协议逆向与实现 · ZincGluxx</title>
+  <link rel="canonical" href="https://zincgluxx.github.io/posts/jlu-drcom-auth.html">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="page-shell">
+    <header class="site-header">
+      <a class="brand" href="/" aria-label="ZincGluxx 博客首页"><span class="brand-mark">Z</span><span>ZincGluxx<span class="brand-dot">.</span></span></a>
+      <nav aria-label="主导航"><a class="nav-link" href="/">文章</a><a class="nav-link" href="https://github.com/ZincGluxx" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a></nav>
+    </header>
+
+    <main class="article-page longform-page">
+      <a class="back-link" href="/">← 返回文章列表</a>
+      <article>
+        <header class="article-header">
+          <div class="post-meta"><time datetime="2026-09-18">2026 年 9 月 18 日</time><span class="meta-divider"></span><span>逆向工程</span><span class="meta-divider"></span><span>约 15 分钟</span></div>
+          <h1>吉林大学校园网认证协议<br><em>逆向与实现</em></h1>
+          <p class="article-lead">从抓包无门到逐字节复现：Dr.COM 私有协议的四阶段拆解、登录帧的完整解剖，以及把「能认证」做成「是软件」的工程思路。</p>
+        </header>
+
+        <div class="article-content">
+          <p>本文基于我实际完成的一个开源项目展开：用 Rust 从零重写吉林大学 Dr.COM 校园网认证客户端（<a href="https://github.com/ZincGluxx/drcom-rs">ZincGluxx/drcom-rs</a>），协议基准与大量参考实现来自社区项目 <a href="https://github.com/ZincGluxx/jlu-drcom-client">jlu-drcom-client</a>。文中所有十六进制示例均取自测试向量（占位账号 <code>testuser</code>），不含任何真实凭据。</p>
+
+          <nav class="article-toc" aria-label="文章目录"><span>阅读顺序</span><ol>
+            <li><a href="#background">背景：我们在和什么协议打交道</a></li>
+            <li><a href="#reverse">逆向的起点：站在四代社区实现上</a></li>
+            <li><a href="#protocol">认证流程详解</a></li>
+            <li><a href="#engineering">从协议到软件：工程思路</a></li>
+            <li><a href="#ending">写在最后</a></li>
+          </ol></nav>
+
+          <h2 id="background">一、背景：我们在和什么协议打交道</h2>
+          <p>吉大校园网用的是<strong>城市热点 Dr.COM 认证系统</strong>。它的位置在 802.1X 之后：机器插上网线能拿到 IP（校园内网可达），但要出外网必须通过 Dr.COM 网关的认证——客户端与认证服务器之间走一套<strong>基于 UDP 的私有二进制协议</strong>，官方客户端是闭源 Windows 程序（核心逻辑在 <code>DrAuthSvr.dll</code> 里，还被加壳保护）。</p>
+          <p>这套协议的几个基本事实：</p>
+          <ul>
+            <li>认证服务器：UDP <code>10.100.61.3:61440</code>（本地端口也固定绑 61440，靠 <code>SO_REUSEADDR</code> 共存）；</li>
+            <li>协议分四个阶段：<strong>挑战（challenge）→ 登录（login）→ 保活（keep-alive）→ 登出（logout）</strong>；</li>
+            <li>报文都是<strong>短二进制帧</strong>，字段靠偏移定位，没有 TLV、没有版本协商头——相当「上古」；</li>
+            <li>服务器在线状态以 <strong>IP + MAC</strong> 为键，同一时刻同一账号只能有一个客户端在线。</li>
+          </ul>
+          <p>官方客户端的问题：闭源、无诊断能力、出问题只给一句模糊提示。于是就有了社区的三次「重新发明」，以及我的第四次——把它做成一个 6.5 MB、内存 24 MiB、带完整诊断的 Rust 原生程序。</p>
+
+          <h2 id="reverse">二、逆向的起点：站在四代社区实现上</h2>
+          <p>从零抓包逆向是被 VMP 壳挡死的（原版 <code>protocol.rs</code> 的 328 字节变体我至今没能拿到实际报文）。真正可行的路径是<strong>逐字节对齐社区参考实现</strong>：</p>
+          <div class="table-scroll"><table><thead><tr><th>世代</th><th>实现</th><th>价值</th></tr></thead><tbody>
+            <tr><td>A</td><td>老版 C/C++ 客户端泄漏源码</td><td>协议结构最原始的出处</td></tr>
+            <tr><td>B</td><td>Python <code>newclient.py</code> / <code>jlu-drcom-py3</code></td><td><strong>本部署实际认证成功过的实现</strong>，我的逐字节基准</td></tr>
+            <tr><td>C</td><td>Java 重写（2017 官方抓包）</td><td>提供官方对照向量与「正确」校验和写法</td></tr>
+            <tr><td>D</td><td>安卓移植</td><td>版本协商字段的交叉验证</td></tr>
+          </tbody></table></div>
+          <p>关键决策：<strong>照抄 B 世代，哪怕它看起来是错的</strong>。最有名的例子是校验和：Python 用 <code>re.findall(b'....', s)</code> 分组，而正则的 <code>.</code> 不匹配 <code>0x0a</code>（换行字节），遇到含 <code>0x0a</code> 的窗口会错位一个字节，导致后面的分组整体偏移。Java 重写「修正」了这一点——但我实测发现，<strong>服务端根本不校验这个和</strong>（C# 移植用正确算法照样认证成功）。结论：照抄 Python 的错误版本，同时把两个版本的结果都钉进测试，防止后人手痒「修正」之后悄悄改变线上行为。</p>
+          <p>这是逆向工程里很重要的一课：<strong>兼容性优先于正确性</strong>。你的目标不是写出教科书代码，而是复现一个正在运行的服务所期待的字节序列。</p>
+
+          <h2 id="protocol">三、认证流程详解</h2>
+
+          <h3>3.1 挑战（Challenge）：20 字节的敲门砖</h3>
+          <p>客户端发 20 字节：</p>
+          <pre><code>01 02 ec f0 10 00 | &lt;nonce:2&gt; | &lt;本机 IP:4&gt; | 00 00 00 00 ...</code></pre>
+          <ul>
+            <li>首字节 <code>01</code> 是操作码，<code>02</code> 是子码；</li>
+            <li>nonce 取 <strong>Unix 秒的低 16 位</strong>（原版客户端调 C 运行时的 <code>time()</code>；社区 Python 版则用 <code>Unix % 0xffff</code>，两者在绝大多数时刻等价，但模数不同——这属于要在向量里钉死的细节）；</li>
+            <li>服务器回 56 字节，<code>02</code> 开头，关键载荷是 <strong>4 字节 salt</strong> 和<strong>序号</strong>，后续登录帧的所有 MD5 都要掺这个 salt。</li>
+          </ul>
+          <p>挑战阶段还有个容易忽略的陷阱：服务器会<strong>记录挑战的来源 IP</strong>，后续状态校验都以此为基准。UDP socket 绑哪个本地 IP，登录帧里就得填哪个 IP，否则就是「来自陌生地址的登录」。</p>
+
+          <h3>3.2 登录帧：368～374 字节的完整解剖</h3>
+          <p>登录帧是整个协议最复杂的部分。以下按偏移铺开（以 8 字节密码的 368 字节为基准）：</p>
+          <div class="table-scroll"><table><thead><tr><th>偏移</th><th>内容</th><th>说明</th></tr></thead><tbody>
+            <tr><td>0</td><td><code>03 01 00</code> + 账号长度+20</td><td>操作码与长度前缀</td></tr>
+            <tr><td>4</td><td><code>md51</code> = MD5(<code>03 01</code> ‖ salt ‖ password)</td><td><strong>复用率最高的摘要</strong>：MAC 掩码、每个保活包都要用</td></tr>
+            <tr><td>20</td><td>账号，固定 36 字节零填充</td><td>超长账号会被拒绝而不是截断（长度字节才是真实长度）</td></tr>
+            <tr><td>58</td><td>MAC ⊕ <code>md51[..6]</code></td><td>MAC 不是明文传输</td></tr>
+            <tr><td>64</td><td><code>md52</code> = MD5(<code>01</code> ‖ password ‖ salt ‖ <code>00 00 00 00</code>)</td><td></td></tr>
+            <tr><td>80</td><td>IP 数(<code>01</code>)、主机 IP、三个空槽</td><td>地址四元组</td></tr>
+            <tr><td>97</td><td><code>md53</code> = MD5(帧前 97 字节 ‖ <code>14 00 07 0b</code>) 取前 8 字节</td><td>帧内自校验</td></tr>
+            <tr><td>110</td><td>主机名，32 字节填充</td><td></td></tr>
+            <tr><td>142</td><td>主 DNS、DHCP、备 DNS</td><td></td></tr>
+            <tr><td>162</td><td>OS 指纹 29 字节 + 55 零字节 + <strong>40 字节 client key</strong></td><td><code>3dc79f52…be7b1</code>，逐字手抄极易错一位</td></tr>
+            <tr><td>310</td><td>认证版本、<code>00</code>、<strong>密码长度</strong></td><td></td></tr>
+            <tr><td>314</td><td>旋转密码块：每字节 XOR <code>md51</code> 对应位再循环左移 3 位</td><td>长度 = 密码长度</td></tr>
+            <tr><td>末尾</td><td><code>02 0c</code>、校验和、<code>00 00</code>、MAC、<strong>零填充 <code>len/4</code> 字节</strong>、<code>60 a2</code>、28 零字节</td><td></td></tr>
+          </tbody></table></div>
+          <p><strong>最重要的工程事实：登录帧长度不是常数。</strong>两个变量决定它：</p>
+          <ol>
+            <li>旋转密码块随密码逐字节增长；</li>
+            <li><code>60 a2</code> 前的零填充是 <code>password.len() / 4</code> 字节（且密码恰好 16 字节时跳过——原版用了浮点除法的巧合）。</li>
+          </ol>
+          <p>所以「368 字节的登录包」只是 8 字符密码那一组向量的特例：</p>
+          <pre><code>密码  8 字节 → 368    10 字节 → 370（2026-09-15 对真实服务器实测）
+密码 12 字节 → 373    16 字节 → 374（跳过填充）</code></pre>
+          <p>我最初的实现就栽在这：把 368 当常数，8 位密码测试全绿，一到真实账号（10 位密码）就发错帧。修复后把 370 这个<strong>实测值</strong>直接钉进测试——不是重新推导，而是防止它再次被「简化」。</p>
+
+          <h3>3.3 保活：40 字节的持续对话</h3>
+          <p>登录成功后，每 20 秒发一个 40 字节的 <code>0x07</code> 包：</p>
+          <pre><code>07 &lt;序号&gt; 28 00 0b &lt;类型&gt; &lt;版本/标记&gt; &lt;nonce:2&gt; &lt;6 零&gt; &lt;4 字节尾&gt; &lt;校验和槽&gt; &lt;本机 IP&gt; &lt;8 零&gt;</code></pre>
+          <p>三个值得单独说的细节：</p>
+          <ul>
+            <li><strong>三种形态</strong>：<code>extra</code>（<code>0f 27</code> 标记，开启一轮保活，每 10 轮重复一次）、<code>data1</code>、<code>data3</code>（携带本机 IP 与折叠校验和，<code>data[0..24] ‖ IP</code> 参与折叠后写回）。重发时<strong>绝不能带 <code>0f 27</code></strong>——参考客户端的重发一律用协商后的版本。</li>
+            <li><strong>版本协商是跳变过程</strong>：服务器回包偏移 28..30 带一对版本字节，客户端下个包就改用新值，再被推回 <code>0000</code>——日志里会出现「保活版本 0000 改为 dc02 又改回 0000」的乒乓。这是正常现象，不是 bug；Python 版硬编码 <code>dc02</code>，Java 版读回包，我的实现取回包。</li>
+            <li><strong><code>07 .. 10</code> 是推送不是应答</strong>：服务器借保活通道推消息（登录后第一条往往就是 <code>This Program can not run in …</code>），两个参考实现都把它当重发提示——重发同一包、计数器递增。</li>
+          </ul>
+
+          <h3>3.4 登出与错误码：错误是服务器说的</h3>
+          <p>登出是 <code>06</code> 开头的帧，结构类似登录但更短。<strong>所有人类可读的失败原因都来自服务器返回的错误码</strong>，客户端只负责显示。最典型的是：</p>
+          <blockquote><strong>错误码 21：<code>ldap auth error</code></strong></blockquote>
+          <p>这是 Dr.COM 服务器把账号密码转交<strong>学校统一身份系统（LDAP）</strong>校验后得到的结论——意味着挑战成功、报文解析正常，卡在最后一步的账号校验。常见原因：密码与统一身份系统不一致、账号被锁、或后端抽风。诊断时要分清层次：<strong>协议层成功 ≠ 账号层通过</strong>。</p>
+          <p>另一个反直觉的现象：LDAP 报错期间网络探针依然可达。因为网关对<strong>旧会话的授权有迟滞</strong>——登录被拒不影响已放行的 IP/MAC，直到服务器侧超时。「能上网」不等于「认证正常」，这句话值得写进每一个认证客户端的 UI。</p>
+
+          <h2 id="engineering">四、从协议到软件：工程思路</h2>
+
+          <h3>4.1 参考向量是生命线</h3>
+          <p>协议实现最大的风险不是「写错」，而是「改对」——某次重构顺手把错误校验和改对了，线上立刻全挂。我的做法：</p>
+          <ol>
+            <li><strong>向量文件</strong>（<code>reference/</code>）：固定 salt、占位账号、多种密码长度、特殊 MAC（最高位为 0 时 <code>dump()</code> 只输出两字节！），全部以十六进制字面量固化，<strong>禁止重新推导</strong>；</li>
+            <li><strong>测试矩阵</strong>：密码 8/10/12/16 字节各一组、36 字节满长账号、短 MAC——登录帧长度、填充、旋转块全部由断言钉住；</li>
+            <li><strong>生成脚本与校验脚本并存</strong>：<code>gen_vectors.py</code> 生成、<code>verify_reference_source.py</code> 直接读参考实现的源码重新核对，防止向量本身抄错。</li>
+          </ol>
+
+          <h3>4.2 架构：把「能认证」和「是软件」分开</h3>
+          <pre><code>transport.rs   UDP 收发（SO_REUSEADDR、瞬态 ICMP 错误重试）
+auth.rs        挑战/登录/登出的原始状态机
+keepalive.rs   保活协商与推送处理
+session.rs     面向应用的会话层（事件流：阶段变化/错误/推送）
+adapter.rs     网卡枚举与地址选择
+config.rs      INI 解析（带错误行号）
+preferences.rs DPAPI 加密的凭据持久化
+event_log.rs   256 KiB 轮转日志
+ui_backend.rs  GUI 与会话层的桥
+diagnostics.rs 双栈体检、诊断导出</code></pre>
+          <p>两个值得展开的传输层细节：</p>
+          <ul>
+            <li><strong><code>SO_REUSEADDR</code> 必须显式设置</strong>：原版客户端和官方 <code>DrAuthSvr.dll</code> 都固定绑 61440，不加这个，任何残留的 Dr.COM 组件占着端口时你的 bind 直接失败；</li>
+            <li><strong>Windows 会把陈旧 ICMP 错误误报给当前调用</strong>：同一 socket 上先前数据包触发的 ICMP port-unreachable，会让下一次 <code>sendto</code>/<code>recv</code> 抛 <code>ConnectionReset</code>——它不代表当前操作失败，必须当瞬态错误重试，否则用户会看到莫名的「首次发送失败」。</li>
+          </ul>
+
+          <h3>4.3 技术选型：Rust + Slint 的实际收益</h3>
+          <p>同类可用方案是 C# + Avalonia（NativeAOT）。同一台机器实测：</p>
+          <div class="table-scroll"><table><thead><tr><th>指标</th><th>Rust + Slint</th><th>C# + Avalonia</th></tr></thead><tbody>
+            <tr><td>安装包</td><td><strong>6.53 MB</strong></td><td>11.57 MB</td></tr>
+            <tr><td>应用本体</td><td><strong>13.31 MB</strong></td><td>32.77 MB</td></tr>
+            <tr><td>工作集内存</td><td><strong>23.8 MiB</strong></td><td>47.9 MiB</td></tr>
+            <tr><td>线程</td><td><strong>4</strong></td><td>11</td></tr>
+          </tbody></table></div>
+          <p>体积差几乎全部来自 Avalonia 捆绑的原生绘图栈（SkiaSharp + libGLESv2 + HarfBuzz ≈ 18 MB）；Slint 用纯 Rust 渲染器。对一个 7×24 小时挂机保活的常驻工具，这个差距有实际意义——虽然两边待机 CPU 都是 0。</p>
+          <p>选型上的教训同样值钱：Slint 布局里 <code>height:</code> 等于同时设 min 和 max，而 <code>HorizontalLayout</code> 跨轴对齐默认是 stretch，固定高度的子项会被钉在行顶——「连接按钮歪了」就是这么来的。另外它的 Windows 托盘后端一个进程只挂一个图标，用户抱怨「多个托盘图标」时先查是不是起了多个进程。</p>
+
+          <h3>4.4 Windows 集成三件套</h3>
+          <ul>
+            <li><strong>单实例</strong>：命名互斥体 + 命名事件。重复启动时唤醒已运行实例把窗口弹出来，而不是弹第二个图标。<code>claim()</code> 必须在创建托盘<strong>之前</strong>。</li>
+            <li><strong>托盘语义</strong>：Slint 默认关闭窗口是 hide——正好利用它实现「关闭到托盘」；只有托盘菜单的退出才真正 <code>NIM_DELETE</code>。强杀进程会留幽灵图标（explorer 划过才消失）。</li>
+            <li><strong>凭据存储</strong>：<code>CryptProtectData</code>（DPAPI）加密落盘，绑定当前用户。自动登录依赖它，但也埋了本文第四节那个坑：<strong>自动登录会用保存的旧密码反复撞 LDAP</strong>。</li>
+          </ul>
+
+          <h3>4.5 诊断设计：让用户自己就能排障</h3>
+          <p>一个认证工具 80% 的支持成本在「到底哪里不通」。所以把诊断做成一等公民：</p>
+          <ul>
+            <li><strong>三层探测</strong>：校内（<code>www.jlu.edu.cn</code>）→ 公网 IPv4 → 公网 IPv6；全部用 <strong>TCP connect 而非 ping</strong>——境外地址 ICMP 通而 443 被丢，ping 会给出完全相反的结论；</li>
+            <li><strong>探测目标必须国内可达</strong>：<code>1.1.1.1</code>、<code>[2606:4700::1111]</code> 在国内本就超时，拿它们测「IPv6 是否正常」是我犯过的真实错误；</li>
+            <li><strong>IPv6 摘要不混列 <code>fe80::</code></strong>：链路本地地址存在不代表双栈可用，只统计全局地址（<code>2001:da8::/32</code> = CERNET2）；</li>
+            <li><strong>事件日志全程记录</strong>：挑战 salt、报文长度、每个错误码。上面 LDAP 案例的结论（「协议层成功、账号层被拒、旧会话余温还在」）就是日志里三行还原出来的。</li>
+          </ul>
+
+          <h2 id="ending">五、写在最后</h2>
+          <p>这个项目最终形态：6.53 MB 安装包、93 项测试、连续 7.5 小时保活零失败、全套 CC BY-NC 4.0 开源。</p>
+          <p>回头看，逆向这类「上古私有协议」的完整方法论可以压缩成四句话：</p>
+          <ol>
+            <li><strong>找正在运行的同协议实现，逐字节对齐它</strong>——哪怕它有 bug；</li>
+            <li><strong>把所有「实测到的意外」钉进向量</strong>，帧长、跳变、异常 MAC 都是；</li>
+            <li><strong>分层</strong>：协议状态机、平台集成、UI 各自独立，向量测试只保护最底层；</li>
+            <li><strong>诊断优先</strong>：认证类软件的 UX 就是你能不能回答「我现在为什么上不了网」。</li>
+          </ol>
+
+          <section class="article-sources" aria-labelledby="sources-title"><h2 id="sources-title">仓库与参考</h2><ol>
+            <li><a href="https://github.com/ZincGluxx/drcom-rs">ZincGluxx/drcom-rs</a>：Rust + Slint 实现，附参考向量与测试矩阵。</li>
+            <li><a href="https://github.com/ZincGluxx/drcom-net-client">ZincGluxx/drcom-net-client</a>：C# + Avalonia 实现与全部开发文档、实测报告。</li>
+            <li><a href="https://github.com/ZincGluxx/jlu-drcom-client">ZincGluxx/jlu-drcom-client</a>：四代社区参考实现汇总。</li>
+          </ol></section>
+          <p><em>本文仅作协议学习与个人使用交流，认证软件请在自有合法账号的校园网内使用，并遵守所在学校与运营商的网络使用规定。</em></p>
+        </div>
+      </article>
+      <div class="article-end"><span>逆向工程 · 2026</span><a href="/">更多文章 →</a></div>
+    </main>
+
+    <footer class="site-footer"><span>© 2026 ZincGluxx</span><span>写作，积累，继续向前。</span></footer>
+  </div>
+</body>
+</html>
